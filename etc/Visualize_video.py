@@ -1,4 +1,5 @@
 import os
+import time
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import cv2
@@ -71,39 +72,31 @@ def relabel(img):
     return img
 
 
-def evaluateModelCV(model, savedir, saveloc, mean, std, imgW, imgH, videoName, Lovasz):
+# 参数imgW, imgH为网络的输入尺寸
+def evaluateModelCV(model, inputDir, outputDir, mean, std, imgW, imgH, videoName, Lovasz):
     # gloabl mean and std values
 
-
-    syn_bg = cv2.imread(os.path.join(savedir,'syn_bg.jpg'))
-
-    videoOut = os.path.join(saveloc,videoName)
-    VideoIn = os.path.join(savedir,videoName)
-
+    videoOut = os.path.join(outputDir,videoName)
+    videoIn = os.path.join(inputDir,videoName)
+    
     print("video is saved in " + videoOut)
-    video = cv2.VideoWriter(videoOut, cv2.VideoWriter_fourcc(*'mp4v'), 30, (imgW, imgH))
 
+    # 输出视频尺寸为输入视频尺寸
+    vidcap = cv2.VideoCapture(videoIn)
+    videoW = int(vidcap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    videoH = int(vidcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    video = cv2.VideoWriter(videoOut, cv2.VideoWriter_fourcc(*'mp4v'), 30, (videoW, videoH))
+    # syn_bg = np.zeros((videoH, videoW, 3), dtype=np.uint8)   # opecv中3通道图像维度是(h, w, 3)，通过shape属性可以看到
+    all_frames = vidcap.get(cv2.CAP_PROP_FRAME_COUNT)
+    frame = 0
     success= True
-    vidcap = cv2.VideoCapture(VideoIn)
-    while (success):
+    init_time = time.clock()
+    while success:
         success, img = vidcap.read()
         if not success or img is None:
             vidcap.release()
             break
-        (h, w) = img.shape[:2]
-        center = (w //2, h // 2)
-        M = cv2.getRotationMatrix2D(center, 270,1.0)
-        cos = np.abs(M[0, 0])
-        sin = np.abs(M[0, 1])
 
-        # compute the new bounding dimensions of the image
-        nW = int((h * sin) + (w * cos))
-        nH = int((h * cos) + (w * sin))
-
-        # adjust the rotation matrix to take into account translation
-        M[0, 2] += (nW / 2) - w //2
-        M[1, 2] += (nH / 2) -  h // 2
-        img = cv2.warpAffine(img, M, (nW, nH))
         img_orig = np.copy(img)
         # PILImage.fromarray(img_orig).show()
 
@@ -117,138 +110,76 @@ def evaluateModelCV(model, savedir, saveloc, mean, std, imgW, imgH, videoName, L
             img[:, :, j] /= std[j]
 
         img /= 255
-        img = img.transpose((2, 0, 1))
+        img = img.transpose((2, 0, 1))   # 维度交换，使其变成通道维度在前
         img_tensor = torch.from_numpy(img)
         img_tensor = torch.unsqueeze(img_tensor, 0)  # add a batch dimension
 
-
         with torch.no_grad():
-            img_variable = torch.autograd.Variable(img_tensor)
-
             if torch.cuda.is_available():
-                img_variable = img_variable.cuda()
+                img_tensor = img_tensor.cuda()
 
-
-            img_out = model(img_variable)
-        img_orig = cv2.resize(img_orig, (imgW, imgH))
-
+            img_out = model(img_tensor)
+        # img_orig = cv2.resize(img_orig, (imgW, imgH))
         if Lovasz:
-            classMap_numpy = (img_out[0].data.cpu() > 0).numpy()[0]
+            classMap_numpy = (img_out[0].cpu() > 0).numpy()[0]
         else:
-            classMap_numpy = img_out[0].max(0)[1].byte().data.cpu().numpy()
+            # 取概率大的那个类作为判别结果，下标0或者1就可以表示人或者背景类
+            classMap_numpy = img_out[0].max(0)[1].byte().cpu().numpy()
 
-        idx_fg = (classMap_numpy == 1)
+        # 先升维成(w, h, 1)，然后把最后一维重复3次，复制成3通道掩码，
+        # 因为如果没有第3维的话和图像相乘的时候不能自动广播
+        # 注意一定要变成uint8类型，不然无法用cv2.resize
+        idx_fg = classMap_numpy[:, :, np.newaxis].astype(np.uint8).repeat(3, axis=2)
+        # 把掩码缩放至原图尺寸
+        idx_fg = cv2.resize(idx_fg, (videoW, videoH))
 
-        syn_bg = cv2.resize(syn_bg, (img_out.size(3), img_out.size(2)))
-        img_orig = cv2.resize(img_orig, (img_out.size(3), img_out.size(2)))
+        seg_img = img_orig*idx_fg
 
-        seg_img = 0 * img_orig
-        seg_img[:, :, 0] = img_orig[:, :, 0] * idx_fg + syn_bg[:, :, 0] * (1 - idx_fg)
-        seg_img[:, :, 1] = img_orig[:, :, 1] * idx_fg + syn_bg[:, :, 1] * (1 - idx_fg)
-        seg_img[:, :, 2] = img_orig[:, :, 2] * idx_fg + syn_bg[:, :, 2] * (1 - idx_fg)
-        seg_img = cv2.resize(seg_img,(imgW, imgH))
+        frame += 1
+        fps = frame/(time.clock() - init_time)
+
+        # 显示fps
+        fps_text = ' %5.2f fps '%(fps)
+        font_face = cv2.FONT_HERSHEY_DUPLEX  # 字体
+        font_scale = 0.6  # 字体大小
+        font_thickness = 1 # 字体粗细
+        textw, texth = cv2.getTextSize(fps_text, font_face, font_scale, font_thickness)[0]
+        seg_img = seg_img.astype(np.float)  # 先转成float，不然无法和0.6相乘
+        seg_img[0:texth+8, videoW-textw-9:] *= 0.6  # 准备把fps信息放在右上角
+        seg_img = seg_img.astype(np.uint8)
+
+        text_point = (videoW-textw-5, texth+4)  # 文字左下角坐标
+        text_color = [255, 255, 255]
+        cv2.putText(seg_img, fps_text, text_point, font_face, font_scale, text_color, font_thickness, cv2.LINE_AA)
 
         video.write(seg_img)
+        print('\rProcessing frames %6d / %6d (%5.2f%%)  fps: %5.2f'%(frame, all_frames, 100*(frame/all_frames), fps), end='')
 
     video.release()
     # cv2.destroyAllWindows()
 
-def evaluateModelPIL(model, savedir, saveloc, mean, std, imgW, imgH, videoName, Lovasz):
-    # gloabl mean and std values
 
-
-    syn_bg = cv2.imread(os.path.join(savedir,'syn_bg.jpg'))
-
-    videoOut = os.path.join(saveloc,videoName)
-    VideoIn = os.path.join(savedir,videoName)
-
-    print("video is saved in " + videoOut)
-    video = cv2.VideoWriter(videoOut, cv2.VideoWriter_fourcc(*'mp4v'), 30, (imgW, imgH))
-
-    success= True
-    vidcap = cv2.VideoCapture(VideoIn)
-    while (success):
-        success, img = vidcap.read()
-        if not success or img is None:
-            vidcap.release()
-            break
-        (h, w) = img.shape[:2]
-        center = (w //2, h // 2)
-        M = cv2.getRotationMatrix2D(center, 270,1.0)
-        cos = np.abs(M[0, 0])
-        sin = np.abs(M[0, 1])
-
-        # compute the new bounding dimensions of the image
-        nW = int((h * sin) + (w * cos))
-        nH = int((h * cos) + (w * sin))
-
-        # adjust the rotation matrix to take into account translation
-        M[0, 2] += (nW / 2) - w //2
-        M[1, 2] += (nH / 2) -  h // 2
-        img = cv2.warpAffine(img, M, (nW, nH))
-        img_orig = np.copy(img)
-        # PILImage.fromarray(img_orig).show()
-
-        img = cv2.resize(img, (imgW, imgH))
-        # PILImage.fromarray(img).show()
-
-        img = img.astype(np.float32)
-        img_tensor = F.to_tensor(img)  # convert to tensor (values between 0 and 1)
-        img_tensor = F.normalize(img_tensor, mean, std)  # normalize the tensor
-
-
-        with torch.no_grad():
-            img_variable = torch.autograd.Variable(img_tensor)
-
-            if torch.cuda.is_available():
-                img_variable = img_variable.cuda()
-
-            img_variable= torch.unsqueeze(img_variable,0)
-            img_out = model(img_variable)
-        img_orig = cv2.resize(img_orig, (imgW, imgH))
-
-        if Lovasz:
-            classMap_numpy = (img_out[0].data.cpu() > 0).numpy()[0]
-        else:
-            classMap_numpy = img_out[0].max(0)[1].byte().data.cpu().numpy()
-
-        idx_fg = (classMap_numpy == 1)
-
-        syn_bg = cv2.resize(syn_bg, (img_out.size(3), img_out.size(2)))
-        img_orig = cv2.resize(img_orig, (img_out.size(3), img_out.size(2)))
-
-        seg_img = 0 * img_orig
-        seg_img[:, :, 0] = img_orig[:, :, 0] * idx_fg + syn_bg[:, :, 0] * (1 - idx_fg)
-        seg_img[:, :, 1] = img_orig[:, :, 1] * idx_fg + syn_bg[:, :, 1] * (1 - idx_fg)
-        seg_img[:, :, 2] = img_orig[:, :, 2] * idx_fg + syn_bg[:, :, 2] * (1 - idx_fg)
-        seg_img = cv2.resize(seg_img,(imgW, imgH))
-
-        video.write(seg_img)
-
-    video.release()
-    # cv2.destroyAllWindows()
-
-def ExportVideo(model, Maxfile, savedir, model_name,  videoName,h,w , mean, std, Lovasz, pil=True):
+# 这里我把参数的顺序调整了，可能导致其他地方调用的时候出问题
+# 这里的h, w参数表示送入网络时的数据尺寸
+def ExportVideo(model, model_name, weightPath, inputDir, videoName, outputDir, w, h, mean, std, Lovasz):
     # read all the images in the folder
 
     if torch.cuda.is_available():
-        model.load_state_dict(torch.load(Maxfile))
+        model.load_state_dict(torch.load(weightPath))
     else:
-        model.load_state_dict(torch.load(Maxfile,"cpu"))
+        model.load_state_dict(torch.load(weightPath,"cpu"))
 
     model.eval()
 
 
-    if not os.path.isdir(savedir):
-        os.mkdir(savedir)
-    if not os.path.isdir(savedir+model_name):
-        os.mkdir(savedir+model_name)
-    saveloc = savedir+model_name
-    if pil:
-        evaluateModelPIL(model, savedir, saveloc, mean, std, w, h, videoName, Lovasz)
-    else:
-        evaluateModelCV(model, savedir, saveloc, mean, std, w, h, videoName, Lovasz)
-
+    if not os.path.isdir(inputDir):
+        os.makedirs(inputDir)
+    
+    outputDir = os.path.join(outputDir,model_name)
+    if not os.path.isdir(outputDir):
+        os.makedirs(outputDir)
+    
+    evaluateModelCV(model, inputDir, outputDir, mean, std, w, h, videoName, Lovasz)
 
 if __name__ == '__main__':
     import models
@@ -256,45 +187,51 @@ if __name__ == '__main__':
 
     parser = ArgumentParser()
 
-    parser.add_argument('-c', '--config', type=str, default='../setting/SINet.json',
+    parser.add_argument('-c', '--config', type=str, default='./setting/Test_SINet.json',
                         help='JSON file for configuration')
+    parser.add_argument('--outputdir', type=str, default="./segVideos/")
+    parser.add_argument('--weight', type=str, default="./result/SINet/SINet.pth")
+    parser.add_argument('--video', type=str, default="./videos/cy_car_0523.mp4")
+    parser.add_argument('--inputW', type=int, default=224)
+    parser.add_argument('--inputH', type=int, default=224)
+    parser.add_argument('--input_size', type=int, default=0)
 
-    Max_name = "../result/Dnc_SINet11-24_2218/model_3.pth"
-    logdir= "../video/Dnc_SINet11-24_2218"
+    args = parser.parse_args()
+    if args.input_size > 0:
+        inputW = args.input_size
+        inputH = args.input_size
+    else:
+        inputW = args.inputW
+        inputH = args.inputH
+
+    #weightPath = "../result/Dnc_SINet11-24_2218/model_3.pth"
+    weightPath = args.weight
+    videoDir, videoName = os.path.split(args.video)
+    outputDir = args.outputdir
+
     mean = [107.304565, 115.69884, 132.35703 ]
     std = [63.97182, 65.1337, 68.29726]
-    args = parser.parse_args()
-
+    
     with open(args.config) as fin:
         config = json.load(fin)
 
-    train_config = config['train_config']
+    train_config = config['test_config']
     data_config = config['data_config']
 
-    model_name = "Dnc_SINet"
+    model_name = train_config['Model']
 
     Lovasz = train_config["loss"] == "Lovasz"
+    # 训练Encoder的时候用的是"Lovasz"损失，测试的时候用Decoder测试，用的CE损失
     if Lovasz:
         train_config["num_classes"] = train_config["num_classes"] -1
-
-    model = models.__dict__[model_name](classes=train_config["num_classes"],
-                                        p=train_config["p"], q=train_config["q"], chnn=train_config["chnn"])
+    if 'SINet' in model_name:
+        model = models.__dict__[model_name](classes=train_config["num_classes"],
+                                            p=train_config["p"], q=train_config["q"], chnn=train_config["chnn"])
+    elif 'ExtremeC3Net' in model_name:
+        model = models.__dict__[model_name](classes=train_config["num_classes"],
+                                            p=train_config["p"], q=train_config["q"], stage1_W=train_config['stage1_W'])
 
     if torch.cuda.device_count() > 0:
         model=model.cuda()
 
-    ExportVideo(model, Max_name, "../video/", logdir, "video1.mp4", data_config["h"], data_config["w"], mean, std, Lovasz,
-                pil=False)
-    #
-    # model_name = ["Stage2_ExtremeC3NetV2",] #  Stage2_ExtremeC3NetV2 or  ExtremeC3Net_small
-    # # file_loc = [""] # directory of model file
-    # weight_list=[  "./result/Stage2_ExtremeC3Net_240_320/model_288.pth"]
-    # # weight_list=[  "./result/Stage2_ExtremeC3NetV208-18_1329/model_283.pth"]
-    #
-    # Video_name = ["video/video1.mp4", "video/video2.mp4"]
-    #
-    # args.model_name =model_name
-    # # args.file_loc = file_loc
-    # args.weight_list= weight_list
-    # args.video = Video_name
-    #
+    ExportVideo(model, model_name, weightPath, videoDir, videoName, outputDir, inputW, inputH, mean, std, Lovasz)

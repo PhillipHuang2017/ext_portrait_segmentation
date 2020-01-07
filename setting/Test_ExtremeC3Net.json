@@ -6,7 +6,7 @@
         "num_classes" : 2,
         "p" : 1,
         "q" : 5,
-        "stage1_W": "",
+        "stage1_W": null,
         "epochs": 3,
         "dnc_batch" : 40,
         "loss" : "Lovasz",
